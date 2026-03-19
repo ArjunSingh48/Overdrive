@@ -199,25 +199,12 @@ class RequestWorkflowService:
         if session_state:
             updated = self._update_with_moonshot(session_state["request_json"], message)
             if updated is not None:
-                hinted = self._parse_follow_up_hint(message, session_state.get("missing_fields", []))
-                merged_update = self._merge_request_data(
-                    self._merge_request_data(session_state["request_json"], updated),
-                    hinted,
-                )
+                merged_update = self._merge_request_data(session_state["request_json"], updated)
                 return ParseResult(
                     request_json=self._normalise_request(merged_update, session_state["request_json"].get("request_text", ""), message),
                     source="moonshot-update",
                 )
-
-            hinted = self._parse_follow_up_hint(message, session_state.get("missing_fields", []))
-            merged = self._merge_request_data(
-                self._merge_request_data(session_state["request_json"], self._heuristic_parse(message)),
-                hinted,
-            )
-            return ParseResult(
-                request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
-                source="heuristic-update",
-            )
+            raise RuntimeError("LLM parser unavailable for follow-up clarification.")
 
         moonshot_result = self._parse_with_moonshot(message)
         if moonshot_result is not None:
@@ -225,11 +212,7 @@ class RequestWorkflowService:
                 request_json=self._normalise_request(moonshot_result, message),
                 source="moonshot",
             )
-
-        return ParseResult(
-            request_json=self._normalise_request(self._heuristic_parse(message), message),
-            source="heuristic",
-        )
+        raise RuntimeError("LLM parser unavailable for request intake.")
 
     def _parse_with_moonshot(self, message: str) -> dict[str, Any] | None:
         api_key = os.getenv("MOONSHOT_API_KEY")
@@ -322,36 +305,6 @@ class RequestWorkflowService:
             cleaned = re.sub(r"```$", "", cleaned).strip()
         return cleaned
 
-    def _heuristic_parse(self, message: str) -> dict[str, Any]:
-        category = self._detect_category(message)
-        country = self._detect_country(message)
-        quantity = self._extract_quantity(message)
-        budget_amount, currency = self._extract_budget(message)
-        required_by_date = self._extract_required_date(message)
-        preferred = self._find_supplier_name(message)
-        return {
-            "category_l1": category["category_l1"] if category else None,
-            "category_l2": category["category_l2"] if category else None,
-            "title": f"{category['category_l2']} procurement request" if category else "Procurement request",
-            "quantity": quantity,
-            "unit_of_measure": category["typical_unit"] if category else None,
-            "budget_amount": budget_amount,
-            "currency": currency,
-            "required_by_date": required_by_date,
-            "country": country,
-            "site": self._extract_site(message),
-            "delivery_countries": [country] if country else [],
-            "preferred_supplier_mentioned": preferred,
-            "incumbent_supplier": None,
-            "contract_type_requested": "purchase",
-            "data_residency_constraint": "data residency" in message.lower(),
-            "esg_requirement": "esg" in message.lower() or "sustainable" in message.lower(),
-            "business_unit": "Frontend Intake",
-            "requester_role": "Requester",
-            "request_language": "en",
-            "scenario_tags": [],
-        }
-
     def _normalise_request(
         self,
         parsed: dict[str, Any],
@@ -359,21 +312,15 @@ class RequestWorkflowService:
         follow_up_message: str | None = None,
     ) -> dict[str, Any]:
         combined_message = original_message if not follow_up_message else f"{original_message}\nFollow-up: {follow_up_message}"
-        category = self._coerce_category(parsed.get("category_l1"), parsed.get("category_l2"), combined_message)
-        country = self._coerce_country(parsed.get("country"), parsed.get("site"), parsed.get("delivery_countries"), combined_message)
+        category = self._coerce_category(parsed.get("category_l1"), parsed.get("category_l2"))
+        country = self._coerce_country(parsed.get("country"), parsed.get("site"), parsed.get("delivery_countries"))
         currency = self._normalise_currency_value(parsed.get("currency")) or CURRENCY_BY_COUNTRY.get(country, "EUR")
         request_id = parsed.get("request_id") or f"REQ-{uuid.uuid4().hex[:8].upper()}"
         title = parsed.get("title") or (f"{category['category_l2']} request" if category else "Procurement request")
 
         quantity = self._coerce_int(parsed.get("quantity"))
-        if quantity is None:
-            quantity = self._extract_quantity(follow_up_message or combined_message)
         budget_amount = self._coerce_float(parsed.get("budget_amount"))
-        if budget_amount is None:
-            budget_source = parsed.get("budget_amount") if isinstance(parsed.get("budget_amount"), str) else None
-            budget_amount, detected_currency = self._extract_budget(budget_source or follow_up_message or combined_message)
-            currency = currency or detected_currency or "EUR"
-        preferred = self._find_supplier_name(parsed.get("preferred_supplier_mentioned") or combined_message)
+        preferred = self._find_supplier_name(parsed.get("preferred_supplier_mentioned"))
         incumbent = self._find_supplier_name(parsed.get("incumbent_supplier") or "")
         delivery_countries = parsed.get("delivery_countries") or ([country] if country else [])
 
@@ -384,7 +331,7 @@ class RequestWorkflowService:
             "request_language": parsed.get("request_language") or "en",
             "business_unit": parsed.get("business_unit") or "Frontend Intake",
             "country": country,
-            "site": parsed.get("site") or self._extract_site(combined_message) or country,
+            "site": parsed.get("site") or country,
             "requester_id": parsed.get("requester_id") or "frontend-user",
             "requester_role": parsed.get("requester_role") or "Requester",
             "submitted_for_id": parsed.get("submitted_for_id") or "frontend-user",
@@ -396,7 +343,7 @@ class RequestWorkflowService:
             "budget_amount": budget_amount,
             "quantity": quantity,
             "unit_of_measure": parsed.get("unit_of_measure") or (category["typical_unit"] if category else None),
-            "required_by_date": parsed.get("required_by_date") or self._extract_required_date(combined_message),
+            "required_by_date": parsed.get("required_by_date"),
             "preferred_supplier_mentioned": preferred,
             "incumbent_supplier": incumbent,
             "contract_type_requested": parsed.get("contract_type_requested") or "purchase",
@@ -460,7 +407,7 @@ class RequestWorkflowService:
         joined = "\n\n".join(prompts)
         return f"I still need a few critical request details before I can run supplier matching.\n{joined}\n"
 
-    def _coerce_category(self, category_l1: str | None, category_l2: str | None, message: str) -> dict[str, str] | None:
+    def _coerce_category(self, category_l1: str | None, category_l2: str | None) -> dict[str, str] | None:
         if category_l1 and category_l2:
             for row in self.categories:
                 if row["category_l1"].lower() == str(category_l1).lower() and row["category_l2"].lower() == str(category_l2).lower():
@@ -469,108 +416,15 @@ class RequestWorkflowService:
             for row in self.categories:
                 if row["category_l2"].lower() == str(category_l2).lower():
                     return row
-        return self._detect_category(message)
-
-    def _detect_category(self, message: str) -> dict[str, str] | None:
-        lowered = message.lower()
-        keyword_map = {
-            "dock": "Docking Stations",
-            "laptop": "Laptops",
-            "notebook": "Laptops",
-            "monitor": "Monitors",
-            "screen": "Monitors",
-            "phone": "Smartphones",
-            "smartphone": "Smartphones",
-            "tablet": "Tablets",
-            "chair": "Office Chairs",
-            "desk": "Workstations and Desks",
-            "cloud compute": "Cloud Compute",
-            "storage": "Cloud Storage",
-            "security": "Cloud Security Services",
-            "software development": "Software Development Services",
-            "cybersecurity": "Cybersecurity Advisory",
-        }
-        for keyword, category_l2 in keyword_map.items():
-            if keyword in lowered:
-                for row in self.categories:
-                    if row["category_l2"] == category_l2:
-                        return row
         return None
 
-    def _coerce_country(self, country: str | None, site: str | None, delivery_countries: list[str] | None, message: str) -> str | None:
-        for candidate in [country, *(delivery_countries or []), site, self._detect_country(message)]:
+    def _coerce_country(self, country: str | None, site: str | None, delivery_countries: list[str] | None) -> str | None:
+        for candidate in [country, *(delivery_countries or []), site]:
             if not candidate:
                 continue
             resolved = COUNTRY_ALIASES.get(str(candidate).strip().lower())
             if resolved:
                 return self._request_country_code(resolved)
-        return None
-
-    def _detect_country(self, message: str) -> str | None:
-        lowered = message.lower()
-        for alias, code in COUNTRY_ALIASES.items():
-            if re.search(rf"\b{re.escape(alias)}\b", lowered):
-                return code
-        for city, code in CITY_TO_COUNTRY.items():
-            if re.search(rf"\b{re.escape(city)}\b", lowered):
-                return code
-        return None
-
-    def _extract_quantity(self, message: str | None) -> int | None:
-        if not message:
-            return None
-        match = re.search(r"\b(\d{1,6})\s+(?:x\s+)?(?:units?|devices?|laptops?|docks?|stations?|chairs?|desks?)\b", message, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-        explicit = re.search(r"\b(?:qty|quantity)\s*[:=]?\s*(\d{1,6})\b", message, re.IGNORECASE)
-        if explicit:
-            return int(explicit.group(1))
-        fallback = re.search(r"\bneed\s+(\d{1,6})\b", message, re.IGNORECASE)
-        if fallback:
-            return int(fallback.group(1))
-        return None
-
-    def _extract_budget(self, message: str | None) -> tuple[float | None, str | None]:
-        if not message:
-            return None, None
-        compact = re.search(r"\b(\d+(?:\.\d+)?)\s*([kKmM])\s*(EUR|CHF|USD|GBP|euro|euros|dollars?)?\b", message, re.IGNORECASE)
-        if compact:
-            base_amount = float(compact.group(1))
-            multiplier = 1000 if compact.group(2).lower() == "k" else 1000000
-            currency_token = compact.group(3)
-            currency = self._normalise_currency(currency_token)
-            return base_amount * multiplier, currency
-        patterns = [
-            (r"(?:budget|capped at|cap of|under|max(?:imum)? of)\s*(?:is\s*)?(?:(EUR|CHF|USD|GBP)\s*)?(\d[\d,\s]*(?:\.\d{1,2})?)\s*(EUR|CHF|USD|GBP)?", 2),
-            (r"(?:(EUR|CHF|USD|GBP)\s*)(\d[\d,\s]*(?:\.\d{1,2})?)", 2),
-            (r"(\d[\d,\s]*(?:\.\d{1,2})?)\s*(EUR|CHF|USD|GBP|euro|euros|dollars?)\b", 1),
-        ]
-        for pattern, amount_group in patterns:
-            match = re.search(pattern, message, re.IGNORECASE)
-            if not match:
-                continue
-            amount = float(match.group(amount_group).replace(",", "").replace(" ", ""))
-            currency_groups = [self._normalise_currency(group) for group in match.groups() if self._normalise_currency(group)]
-            currency = currency_groups[0] if currency_groups else None
-            if amount >= 100:
-                return amount, currency
-        return None, None
-
-    def _extract_required_date(self, message: str | None) -> str | None:
-        if not message:
-            return None
-        iso_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", message)
-        if iso_match:
-            return iso_match.group(1)
-        return None
-
-    def _extract_site(self, message: str | None) -> str | None:
-        if not message:
-            return None
-        lowered = message.lower()
-        for city in CITY_TO_COUNTRY:
-            if re.search(rf"\b{re.escape(city)}\b", lowered):
-                return city.title()
         return None
 
     def _extract_requested_product_phrase(self, message: str | None) -> str | None:
@@ -693,36 +547,6 @@ class RequestWorkflowService:
             merged[key] = value
         return merged
 
-    def _parse_follow_up_hint(self, message: str, missing_fields: list[dict[str, Any]]) -> dict[str, Any]:
-        hinted: dict[str, Any] = {}
-        field_names = {item.get("field") for item in missing_fields}
-        stripped = message.strip()
-
-        if "quantity" in field_names:
-            plain_quantity = re.fullmatch(r"\d{1,6}", stripped.replace(",", ""))
-            if plain_quantity:
-                hinted["quantity"] = int(stripped.replace(",", ""))
-
-        if "budget_amount" in field_names and "budget_amount" not in hinted:
-            budget_amount, currency = self._extract_budget(stripped)
-            if budget_amount is not None:
-                hinted["budget_amount"] = budget_amount
-                if currency:
-                    hinted["currency"] = currency
-
-        if "currency" in field_names and "currency" not in hinted:
-            currency = self._normalise_currency(stripped)
-            if currency:
-                hinted["currency"] = currency
-
-        if "country" in field_names:
-            country = self._coerce_country(stripped, None, None, stripped)
-            if country:
-                hinted["country"] = country
-                hinted["delivery_countries"] = [country]
-
-        return hinted
-
     def _normalise_currency(self, token: str | None) -> str | None:
         if not token:
             return None
@@ -759,9 +583,6 @@ class RequestWorkflowService:
         if isinstance(value, (int, float)):
             return float(value)
         if isinstance(value, str):
-            compact_amount, _ = self._extract_budget(value)
-            if compact_amount is not None:
-                return compact_amount
             try:
                 return float(value.replace(",", "").strip())
             except ValueError:

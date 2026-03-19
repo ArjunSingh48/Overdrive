@@ -4,7 +4,7 @@ import os
 from typing import Any
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -64,7 +64,10 @@ def match(payload: MatchRequest) -> dict[str, Any]:
 
 @app.post("/workflow")
 def workflow(payload: ChatWorkflowRequest) -> dict[str, Any]:
-    result = workflow_service.run(payload.message.strip(), payload.session_id)
+    try:
+        result = workflow_service.run(payload.message.strip(), payload.session_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     request_id = result["request"]["request_id"]
 
     print(f"[workflow] status={result['status']} request_id={request_id} parser={result['parser_source']} session_id={result['session_id']}")
