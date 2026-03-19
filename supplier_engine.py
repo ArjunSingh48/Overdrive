@@ -87,6 +87,8 @@ class SupplierEngine:
         else:
             self._weights = self._DEFAULT_WEIGHTS
 
+        self._benchmark_score = self._build_benchmark(data_dir)
+
     # ------------------------------------------------------------------
     # Policy index builders
     # ------------------------------------------------------------------
@@ -103,6 +105,61 @@ class SupplierEngine:
             key = (rs["supplier_id"], rs["category_l2"])
             result[key] = rs.get("restriction_scope", [])
         return result
+
+    def _build_benchmark(self, data_dir: Path) -> float | None:
+        requests_list = _load_json(data_dir / "requests.json")
+        req_lookup = {r["request_id"]: r for r in requests_list}
+
+        # Build supplier lookup: first row per supplier_id
+        sup_lookup: dict[str, dict] = {}
+        for row in self.suppliers:
+            sid = row["supplier_id"]
+            if sid not in sup_lookup:
+                sup_lookup[sid] = row
+
+        w = self._weights
+        s = self._WEIGHT_SCALE
+        scores: list[float] = []
+
+        for award in self.awards:
+            if str(award.get("award_rank")) != "1":
+                continue
+            req = req_lookup.get(award["request_id"])
+            if req is None:
+                continue
+            sup = sup_lookup.get(award["supplier_id"])
+            if sup is None:
+                continue
+
+            cat_l2 = award.get("category_l2", "")
+            sup_id = award["supplier_id"]
+            sup_name = award.get("supplier_name", "")
+            incumbent = req.get("incumbent_supplier")
+            preferred_mentioned = req.get("preferred_supplier_mentioned")
+            esg_req = bool(req.get("esg_requirement"))
+
+            is_preferred = (sup_id, cat_l2) in self._preferred_set
+            is_incumbent = bool(incumbent and incumbent.lower() in sup_name.lower())
+            is_mentioned = bool(preferred_mentioned and preferred_mentioned.lower() in sup_name.lower())
+
+            quality = int(sup.get("quality_score", 50))
+            risk = int(sup.get("risk_score", 50))
+            esg = int(sup.get("esg_score", 50))
+            esg_w = w["esg_score"] * (2.0 if esg_req else 1.0)
+
+            score = (
+                + risk * w["risk_score"] * s
+                - quality * w["quality_score"] * s
+                - esg * esg_w * s
+                - float(is_preferred) * w["is_preferred"] * s
+                - float(is_incumbent) * w["is_incumbent"] * s
+                - float(is_mentioned) * w["is_mentioned"] * s
+            )
+            scores.append(score)
+
+        if not scores:
+            return None
+        return min(scores)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -991,6 +1048,12 @@ class SupplierEngine:
                 + len(violation_reasons) * 1_000_000
             )
 
+            if self._benchmark_score is not None and self._benchmark_score < 0 and not violation_reasons:
+                raw_conf = (score / self._benchmark_score) * 100
+                confidence_pct = round(min(max(raw_conf, 0.0), 100.0), 1)
+            else:
+                confidence_pct = 0.0 if violation_reasons else None
+
             # Build human-readable note
             notes: list[str] = []
             if violation_reasons:
@@ -1024,6 +1087,7 @@ class SupplierEngine:
                 "country_hq": sup.get("country_hq"),
                 "preferred": is_preferred,
                 "incumbent": is_incumbent,
+                "confidence_pct": confidence_pct,
                 "pricing_tier_applied": f"{p.get('min_quantity', '?')}–{p.get('max_quantity', '?')} units" if p else "N/A",
                 "unit_price_eur": unit_price,
                 "total_price_eur": total,
