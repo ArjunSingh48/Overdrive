@@ -603,6 +603,7 @@ class RequestWorkflowService:
                 "standardLeadTimeDays": supplier.get("standard_lead_time_days"),
                 "expeditedLeadTimeDays": supplier.get("expedited_lead_time_days"),
                 "recommendationNote": supplier.get("recommendation_note"),
+                "confidencePct": supplier.get("confidence_pct"),
             })
         for supplier in excluded:
             row = self._supplier_by_id.get(supplier["supplier_id"], {})
