@@ -73,6 +73,10 @@ _BELOW_THRESHOLD_RE = re.compile(
     r"below\s+([A-Z]{3})(?:/([A-Z]{3}))?\s*([0-9][0-9,]*(?:\.\d+)?)",
     re.IGNORECASE,
 )
+_EXCEPTION_APPROVER_RE = re.compile(
+    r"requires?\s+(.+?)\s+exception approval",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +99,7 @@ class SupplierEngine:
     def __init__(self, data_dir: Path = DATA_DIR):
         self.suppliers = _load_csv(data_dir / "suppliers.csv")
         self.pricing = _load_csv(data_dir / "pricing.csv")
-        self.policies = _load_json(data_dir / "policies.json")
+        self.policies = _load_json(data_dir / "cleaned_policies.json")
         self.awards = _load_csv(data_dir / "historical_awards.csv")
         self._today = date.today()
 
@@ -214,27 +218,58 @@ class SupplierEngine:
         amount = float(match.group(3).replace(",", ""))
         return currencies, amount
 
-    def _restriction_reason_for_total(
+    def _restriction_exception_approver(self, reason: str) -> str | None:
+        match = _EXCEPTION_APPROVER_RE.search(reason)
+        if match:
+            return match.group(1).strip()
+        if "exception approval" in reason.lower():
+            return "Policy Exception Review"
+        return None
+
+    def _evaluate_restriction(
         self,
         policy_rows: list[dict[str, Any]],
         primary_country: str,
         delivery_countries: list[str],
         total_value: float | None = None,
         currency: str | None = None,
-    ) -> str | None:
+    ) -> dict[str, Any] | None:
         for row in self._restriction_scope_matches(policy_rows, primary_country, delivery_countries):
             reason = row.get("restriction_reason", "Policy restricted.")
             threshold = self._restriction_threshold(reason)
+            approver = self._restriction_exception_approver(reason)
             if threshold is None:
-                return reason
+                if approver:
+                    return {
+                        "action": "approval_required",
+                        "reason": reason,
+                        "approver": approver,
+                    }
+                return {
+                    "action": "exclude",
+                    "reason": reason,
+                    "approver": None,
+                }
             if total_value is None or currency is None:
                 continue
             allowed_currencies, max_amount = threshold
-            if currency.upper() in allowed_currencies and total_value >= max_amount:
-                return (
-                    f"{reason} Evaluated total {currency.upper()} {total_value:,.2f} "
-                    f"exceeds the allowed threshold."
-                )
+            if currency.upper() not in allowed_currencies or total_value < max_amount:
+                continue
+            detailed_reason = (
+                f"{reason} Evaluated total {currency.upper()} {total_value:,.2f} "
+                f"exceeds the allowed threshold."
+            )
+            if approver:
+                return {
+                    "action": "approval_required",
+                    "reason": detailed_reason,
+                    "approver": approver,
+                }
+            return {
+                "action": "exclude",
+                "reason": detailed_reason,
+                "approver": None,
+            }
         return None
 
     # ------------------------------------------------------------------
@@ -283,18 +318,27 @@ class SupplierEngine:
                 })
                 continue
             total_value = float(pricing_row["unit_price"]) * (quantity or 1)
-            restriction_reason = self._restriction_reason_for_total(
+            restriction_eval = self._evaluate_restriction(
                 self._restricted_map.get((sup["supplier_id"], cat_l1, cat_l2), []),
                 primary_country,
                 delivery_countries,
                 total_value=total_value,
                 currency=currency,
             )
-            if restriction_reason is not None:
+            if restriction_eval and restriction_eval["action"] == "exclude":
                 excluded.append({
                     "supplier_id": sup["supplier_id"],
                     "supplier_name": sup["supplier_name"],
-                    "reason": restriction_reason,
+                    "reason": restriction_eval["reason"],
+                })
+                continue
+            if restriction_eval and restriction_eval["action"] == "approval_required":
+                priced.append({
+                    **sup,
+                    "pricing": pricing_row,
+                    "policy_exception_required": True,
+                    "policy_exception_reason": restriction_eval["reason"],
+                    "policy_exception_approver": restriction_eval["approver"],
                 })
                 continue
             priced.append({**sup, "pricing": pricing_row})
@@ -318,13 +362,6 @@ class SupplierEngine:
         policy_eval = self._evaluate_policy(
             request, priced, quantity, budget, currency,
             primary_country, cat_l1, cat_l2, escalations
-        )
-        policy_trace = self._build_policy_trace(
-            request=request,
-            priced=priced,
-            policy_eval=policy_eval,
-            escalations=escalations,
-            validation_issues=validation_issues,
         )
 
         # ── 5. Budget feasibility check ────────────────────────────────
@@ -404,6 +441,14 @@ class SupplierEngine:
         shortlist = self._rank(
             priced, quantity, budget, incumbent,
             preferred_mentioned, esg_req, required_by, today
+        )
+        self._add_top_supplier_exception_escalation(shortlist, escalations)
+        policy_trace = self._build_policy_trace(
+            request=request,
+            priced=priced,
+            policy_eval=policy_eval,
+            escalations=escalations,
+            validation_issues=validation_issues,
         )
 
         # ── 8. Assemble output ─────────────────────────────────────────
@@ -564,16 +609,16 @@ class SupplierEngine:
                 continue
 
             # Policy restriction
-            restriction_reason = self._restriction_reason_for_total(
+            restriction_eval = self._evaluate_restriction(
                 self._restricted_map.get((sup_id, cat_l1, cat_l2), []),
                 primary_country,
                 delivery_countries,
             )
-            if restriction_reason is not None:
+            if restriction_eval and restriction_eval["action"] == "exclude":
                 excluded.append({
                     "supplier_id": sup_id,
                     "supplier_name": row["supplier_name"],
-                    "reason": restriction_reason,
+                    "reason": restriction_eval["reason"],
                 })
                 seen.add(sup_id)
                 continue
@@ -635,15 +680,22 @@ class SupplierEngine:
             if pricing_row is None:
                 violations.append("no pricing row for this region/currency")
             total_value = float(pricing_row["unit_price"]) * (quantity or 1) if pricing_row and pricing_row.get("unit_price") else None
-            restriction_reason = self._restriction_reason_for_total(
+            restriction_eval = self._evaluate_restriction(
                 self._restricted_map.get((sup_id, cat_l1, cat_l2), []),
                 primary_country,
                 delivery_countries,
                 total_value=total_value,
                 currency=currency if total_value is not None else None,
             )
-            if restriction_reason is not None:
-                violations.append(restriction_reason)
+            if restriction_eval is not None:
+                violations.append(restriction_eval["reason"])
+                if restriction_eval["action"] == "approval_required":
+                    row = {
+                        **row,
+                        "policy_exception_required": True,
+                        "policy_exception_reason": restriction_eval["reason"],
+                        "policy_exception_approver": restriction_eval["approver"],
+                    }
 
             candidates.append({
                 **row,
@@ -1122,6 +1174,9 @@ class SupplierEngine:
             is_mentioned = bool(
                 preferred_mentioned and preferred_mentioned.lower() in name.lower())
             over_budget = budget is not None and total is not None and total > budget
+            policy_exception_required = bool(sup.get("policy_exception_required"))
+            policy_exception_reason = sup.get("policy_exception_reason")
+            policy_exception_approver = sup.get("policy_exception_approver")
 
             # Scoring weights fitted by pairwise logistic regression against
             # historical_awards.csv (see fit_scoring_weights.py).
@@ -1138,6 +1193,7 @@ class SupplierEngine:
                 - float(is_preferred) * w["is_preferred"] * s
                 - float(is_incumbent) * w["is_incumbent"] * s
                 - float(is_mentioned) * w["is_mentioned"] * s
+                + float(policy_exception_required) * 100_000
                 # best-bad always last
                 + len(violation_reasons) * 1_000_000
             )
@@ -1159,6 +1215,10 @@ class SupplierEngine:
                 notes.append("Incumbent supplier.")
             if is_mentioned:
                 notes.append("Requester's stated preference.")
+            if policy_exception_required:
+                notes.append(
+                    f"Exception approval required from {policy_exception_approver}: {policy_exception_reason}"
+                )
             if over_budget:
                 notes.append(
                     f"Total {total:,.2f} exceeds budget {budget:,.2f}.")
@@ -1192,9 +1252,12 @@ class SupplierEngine:
                 "quality_score": quality,
                 "risk_score": risk,
                 "esg_score": esg,
-                "policy_compliant": not bool(violation_reasons),
+                "policy_compliant": not bool(violation_reasons) and not policy_exception_required,
                 "violation_reasons": violation_reasons or None,
                 "covers_delivery_country": not any("cover" in v for v in violation_reasons),
+                "policy_exception_required": policy_exception_required,
+                "policy_exception_reason": policy_exception_reason,
+                "policy_exception_approver": policy_exception_approver,
                 "recommendation_note": " ".join(notes) if notes else "No issues.",
             }))
 
@@ -1313,6 +1376,33 @@ class SupplierEngine:
                 return text[max(0, idx):idx + 60].strip()
         return None
 
+    def _add_top_supplier_exception_escalation(
+        self,
+        shortlist: list[dict[str, Any]],
+        escalations: list[dict[str, Any]],
+    ) -> None:
+        if not shortlist:
+            return
+        top = shortlist[0]
+        if not top.get("policy_exception_required"):
+            return
+        approver = top.get("policy_exception_approver") or "Policy Exception Review"
+        trigger = top.get("policy_exception_reason") or f"Supplier {top['supplier_name']} requires exception approval."
+        if any(
+            e.get("rule") == "RS-001"
+            and e.get("escalate_to") == approver
+            and top["supplier_name"] in e.get("trigger", "")
+            for e in escalations
+        ):
+            return
+        escalations.append({
+            "escalation_id": f"ESC-{len(escalations)+1:03d}",
+            "rule": "RS-001",
+            "trigger": f"Recommended supplier {top['supplier_name']} requires exception approval. {trigger}",
+            "escalate_to": approver,
+            "blocking": False,
+        })
+
     def _build_audit_trail(
         self,
         req: dict,
@@ -1342,7 +1432,7 @@ class SupplierEngine:
                 f"{country_to_region(country)} region, {req['currency']} currency"
             ),
             "data_sources_used": [
-                "requests.json", "suppliers.csv", "pricing.csv", "policies.json"
+                "requests.json", "suppliers.csv", "pricing.csv", "cleaned_policies.json"
             ],
             "historical_awards_consulted": len(hist) > 0,
             "historical_award_note": (
