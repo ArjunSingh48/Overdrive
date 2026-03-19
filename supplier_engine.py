@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 from csv import DictReader
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -50,6 +51,30 @@ def _load_csv(path: Path) -> list[dict]:
         return list(DictReader(f))
 
 
+def _matches_category_scope(policy_row: dict[str, Any], cat_l1: str, cat_l2: str) -> bool:
+    row_l1 = policy_row.get("category_l1")
+    row_l2 = policy_row.get("category_l2")
+
+    if row_l1 is not None and row_l1 != cat_l1:
+        return False
+    if row_l2 is not None and row_l2 != cat_l2:
+        return False
+    return True
+
+
+def _matches_policy_applies_to(policy_row: dict[str, Any], cat_l1: str, cat_l2: str) -> bool:
+    applies_to = policy_row.get("applies_to")
+    if not applies_to:
+        return True
+    return cat_l2 in applies_to or cat_l1 in applies_to
+
+
+_BELOW_THRESHOLD_RE = re.compile(
+    r"below\s+([A-Z]{3})(?:/([A-Z]{3}))?\s*([0-9][0-9,]*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -75,9 +100,9 @@ class SupplierEngine:
         self._today = date.today()
 
         # Pre-built policy lookup sets
-        # {(supplier_id, category_l2)}
+        # {(supplier_id, category_l1, category_l2)}
         self._preferred_set = self._build_preferred_set()
-        # {(supplier_id, category_l2): [scope]}
+        # {(supplier_id, category_l1, category_l2): [policy rows]}
         self._restricted_map = self._build_restricted_map()
 
         # Load fitted scoring weights if available, else fall back to defaults
@@ -93,17 +118,17 @@ class SupplierEngine:
     # Policy index builders
     # ------------------------------------------------------------------
 
-    def _build_preferred_set(self) -> set[tuple[str, str]]:
+    def _build_preferred_set(self) -> set[tuple[str, str, str]]:
         return {
-            (ps["supplier_id"], ps["category_l2"])
+            (ps["supplier_id"], ps["category_l1"], ps["category_l2"])
             for ps in self.policies["preferred_suppliers"]
         }
 
-    def _build_restricted_map(self) -> dict[tuple[str, str], list[str]]:
-        result: dict[tuple[str, str], list[str]] = {}
+    def _build_restricted_map(self) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+        result: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
         for rs in self.policies["restricted_suppliers"]:
-            key = (rs["supplier_id"], rs["category_l2"])
-            result[key] = rs.get("restriction_scope", [])
+            key = (rs["supplier_id"], rs["category_l1"], rs["category_l2"])
+            result.setdefault(key, []).append(rs)
         return result
 
     def _build_benchmark(self, data_dir: Path) -> float | None:
@@ -138,7 +163,8 @@ class SupplierEngine:
             preferred_mentioned = req.get("preferred_supplier_mentioned")
             esg_req = bool(req.get("esg_requirement"))
 
-            is_preferred = (sup_id, cat_l2) in self._preferred_set
+            cat_l1 = award.get("category_l1", req.get("category_l1", ""))
+            is_preferred = (sup_id, cat_l1, cat_l2) in self._preferred_set
             is_incumbent = bool(incumbent and incumbent.lower() in sup_name.lower())
             is_mentioned = bool(preferred_mentioned and preferred_mentioned.lower() in sup_name.lower())
 
@@ -160,6 +186,56 @@ class SupplierEngine:
         if not scores:
             return None
         return min(scores)
+
+    def _restriction_scope_matches(
+        self,
+        policy_rows: list[dict[str, Any]],
+        primary_country: str,
+        delivery_countries: list[str],
+    ) -> list[dict[str, Any]]:
+        matches: list[dict[str, Any]] = []
+        for row in policy_rows:
+            scopes = row.get("restriction_scope", [])
+            if (
+                "all" in scopes
+                or primary_country in scopes
+                or any(country in scopes for country in delivery_countries)
+            ):
+                matches.append(row)
+        return matches
+
+    def _restriction_threshold(self, reason: str) -> tuple[set[str], float] | None:
+        match = _BELOW_THRESHOLD_RE.search(reason)
+        if not match:
+            return None
+        currencies = {match.group(1).upper()}
+        if match.group(2):
+            currencies.add(match.group(2).upper())
+        amount = float(match.group(3).replace(",", ""))
+        return currencies, amount
+
+    def _restriction_reason_for_total(
+        self,
+        policy_rows: list[dict[str, Any]],
+        primary_country: str,
+        delivery_countries: list[str],
+        total_value: float | None = None,
+        currency: str | None = None,
+    ) -> str | None:
+        for row in self._restriction_scope_matches(policy_rows, primary_country, delivery_countries):
+            reason = row.get("restriction_reason", "Policy restricted.")
+            threshold = self._restriction_threshold(reason)
+            if threshold is None:
+                return reason
+            if total_value is None or currency is None:
+                continue
+            allowed_currencies, max_amount = threshold
+            if currency.upper() in allowed_currencies and total_value >= max_amount:
+                return (
+                    f"{reason} Evaluated total {currency.upper()} {total_value:,.2f} "
+                    f"exceeds the allowed threshold."
+                )
+        return None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -204,6 +280,21 @@ class SupplierEngine:
                     "supplier_id": sup["supplier_id"],
                     "supplier_name": sup["supplier_name"],
                     "reason": "No valid pricing row for category / region / currency.",
+                })
+                continue
+            total_value = float(pricing_row["unit_price"]) * (quantity or 1)
+            restriction_reason = self._restriction_reason_for_total(
+                self._restricted_map.get((sup["supplier_id"], cat_l1, cat_l2), []),
+                primary_country,
+                delivery_countries,
+                total_value=total_value,
+                currency=currency,
+            )
+            if restriction_reason is not None:
+                excluded.append({
+                    "supplier_id": sup["supplier_id"],
+                    "supplier_name": sup["supplier_name"],
+                    "reason": restriction_reason,
                 })
                 continue
             priced.append({**sup, "pricing": pricing_row})
@@ -433,7 +524,7 @@ class SupplierEngine:
             sup_id = row["supplier_id"]
 
             # Category match (one row per supplier × category_l2)
-            if row["category_l1"] != cat_l1 or row["category_l2"] != cat_l2:
+            if not _matches_category_scope(row, cat_l1, cat_l2):
                 continue
 
             # Dedup — keep first matching row per supplier
@@ -473,16 +564,16 @@ class SupplierEngine:
                 continue
 
             # Policy restriction
-            restricted_scopes = self._restricted_map.get((sup_id, cat_l2), [])
-            if (
-                "all" in restricted_scopes
-                or primary_country in restricted_scopes
-                or any(c in restricted_scopes for c in delivery_countries)
-            ):
+            restriction_reason = self._restriction_reason_for_total(
+                self._restricted_map.get((sup_id, cat_l1, cat_l2), []),
+                primary_country,
+                delivery_countries,
+            )
+            if restriction_reason is not None:
                 excluded.append({
                     "supplier_id": sup_id,
                     "supplier_name": row["supplier_name"],
-                    "reason": f"Policy-restricted for {cat_l2} in {primary_country}.",
+                    "reason": restriction_reason,
                 })
                 seen.add(sup_id)
                 continue
@@ -519,7 +610,7 @@ class SupplierEngine:
 
         for row in self.suppliers:
             sup_id = row["supplier_id"]
-            if row["category_l1"] != cat_l1 or row["category_l2"] != cat_l2:
+            if not _matches_category_scope(row, cat_l1, cat_l2):
                 continue
             if sup_id in seen:
                 continue
@@ -536,14 +627,6 @@ class SupplierEngine:
             if not any(c in service_regions for c in delivery_countries):
                 violations.append(f"does not cover {delivery_countries}")
 
-            restricted_scopes = self._restricted_map.get((sup_id, cat_l2), [])
-            if (
-                "all" in restricted_scopes
-                or primary_country in restricted_scopes
-                or any(c in restricted_scopes for c in delivery_countries)
-            ):
-                violations.append(f"policy-restricted in {primary_country}")
-
             if not violations:
                 continue  # passed all filters — not a best-bad candidate
 
@@ -551,6 +634,16 @@ class SupplierEngine:
                 sup_id, cat_l1, cat_l2, region, currency, quantity)
             if pricing_row is None:
                 violations.append("no pricing row for this region/currency")
+            total_value = float(pricing_row["unit_price"]) * (quantity or 1) if pricing_row and pricing_row.get("unit_price") else None
+            restriction_reason = self._restriction_reason_for_total(
+                self._restricted_map.get((sup_id, cat_l1, cat_l2), []),
+                primary_country,
+                delivery_countries,
+                total_value=total_value,
+                currency=currency if total_value is not None else None,
+            )
+            if restriction_reason is not None:
+                violations.append(restriction_reason)
 
             candidates.append({
                 **row,
@@ -582,8 +675,7 @@ class SupplierEngine:
         def _match(p: dict, rgn: str) -> bool:
             return (
                 p["supplier_id"] == supplier_id
-                and p["category_l1"] == cat_l1
-                and p["category_l2"] == cat_l2
+                and _matches_category_scope(p, cat_l1, cat_l2)
                 and p["region"] == rgn
                 and p["currency"] == currency
                 and p.get("valid_from", "0000-00-00") <= today_str
@@ -601,8 +693,7 @@ class SupplierEngine:
                 p for p in self.pricing
                 if (
                     p["supplier_id"] == supplier_id
-                    and p["category_l1"] == cat_l1
-                    and p["category_l2"] == cat_l2
+                    and _matches_category_scope(p, cat_l1, cat_l2)
                     and p["region"] == "EU"
                     and p["currency"] == "EUR"
                     and p.get("valid_from", "0000-00-00") <= today_str
@@ -663,7 +754,7 @@ class SupplierEngine:
                 None,
             )
             if matched:
-                is_pref = (matched["supplier_id"],
+                is_pref = (matched["supplier_id"], cat_l1,
                            cat_l2) in self._preferred_set
                 preferred_eval = {
                     "supplier": matched["supplier_name"],
@@ -717,7 +808,7 @@ class SupplierEngine:
         # Category rules
         cat_rules = [
             cr for cr in self.policies.get("category_rules", [])
-            if cr["category_l1"] == cat_l1 and cr["category_l2"] == cat_l2
+            if _matches_category_scope(cr, cat_l1, cat_l2)
         ]
         for cr in cat_rules:
             self._apply_category_rule(
@@ -726,8 +817,11 @@ class SupplierEngine:
         # Geography rules
         geo_rules = [
             gr for gr in self.policies.get("geography_rules", [])
-            if gr.get("country") == primary_country
-            or primary_country in gr.get("countries", [])
+            if (
+                gr.get("country") == primary_country
+                or primary_country in gr.get("countries", [])
+            )
+            and _matches_policy_applies_to(gr, cat_l1, cat_l2)
         ]
 
         return {
@@ -1022,7 +1116,7 @@ class SupplierEngine:
             risk = int(sup.get("risk_score",    50))
             esg = int(sup.get("esg_score",     50))
 
-            is_preferred = (sup_id, sup["category_l2"]) in self._preferred_set
+            is_preferred = (sup_id, sup["category_l1"], sup["category_l2"]) in self._preferred_set
             is_incumbent = bool(
                 incumbent and incumbent.lower() in name.lower())
             is_mentioned = bool(
