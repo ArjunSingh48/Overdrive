@@ -249,6 +249,9 @@ class RequestWorkflowService:
                 r"(\d[\d,]*)\s*(?:units?|devices?|sets?|pcs?|pieces?|licenses?|seats?|subscriptions?|instances?)\b",
                 text, re.IGNORECASE,
             )
+            if not qty_match and "budget_amount" not in missing_names:
+                # If budget is already known, a bare number is unambiguously quantity
+                qty_match = re.search(r"(\d[\d,]*)", text)
             if qty_match:
                 qty = self._coerce_int(qty_match.group(1))
                 if qty and qty > 0:
@@ -295,7 +298,8 @@ class RequestWorkflowService:
                     break
 
             # Fallback: use a bare number ONLY when it's the only number in the entire message
-            if "budget_amount" not in updates:
+            # AND quantity is not also missing (ambiguous which field the number belongs to)
+            if "budget_amount" not in updates and "quantity" not in missing_names:
                 all_numbers = list(re.finditer(r"[\d,]+(?:\.\d+)?", text))
                 if len(all_numbers) == 1:
                     raw_num = all_numbers[0].group(0).replace(",", "")
@@ -595,52 +599,51 @@ class RequestWorkflowService:
                 return row.get("typical_unit") or None
         return None
 
-    def _build_follow_up_question(self, missing_fields: list[dict[str, Any]], request_json: dict[str, Any] | None = None) -> str:
+    def _build_follow_up_questions(self, missing_fields: list[dict[str, Any]], request_json: dict[str, Any] | None = None) -> list[dict[str, str]]:
         typical_unit = self._get_typical_unit(request_json) if request_json else None
-        prompts: list[str] = []
+        questions: list[dict[str, str]] = []
         for item in missing_fields:
             field = item["field"]
             criteria = item["criteria"]
             if field == "category_l2":
                 attempted_value = item.get("attempted_value")
                 if attempted_value:
-                    return f"{attempted_value} is not a supported product category.\nPlease provide a valid category."
-                examples = ", ".join(criteria["values"][:5])
-                prompts.append(f"What product are you buying? Use a category such as {examples}.")
+                    questions.append({"field": field, "question": f"{attempted_value} is not a supported product category. Please provide a valid category."})
+                else:
+                    examples = ", ".join(criteria["values"][:5])
+                    questions.append({"field": field, "question": f"What product are you buying? Use a category such as {examples}."})
             elif field == "country":
                 attempted_value = item.get("attempted_value")
                 if item.get("reason") == "invalid" and attempted_value:
-                    prompts.append(
-                        f"I interpreted the delivery country as {attempted_value}, but that country is not supported by the current policy dataset."
-                    )
+                    questions.append({"field": field, "question": f"I interpreted the delivery country as {attempted_value}, but that country is not supported by the current policy dataset."})
                 else:
-                    prompts.append("Which delivery country should I use?")
+                    questions.append({"field": field, "question": "Which delivery country should I use?"})
             elif field == "quantity":
                 attempted_value = item.get("attempted_value")
                 if item.get("reason") == "invalid" and attempted_value:
-                    prompts.append(f"I could not use the quantity value {attempted_value}.")
+                    questions.append({"field": field, "question": f"I could not use the quantity value {attempted_value}."})
                 elif typical_unit:
                     unit_display = typical_unit.replace("_", " ")
-                    prompts.append(f"How many {unit_display}s do you need?")
+                    questions.append({"field": field, "question": f"How many {unit_display}s do you need?"})
                 else:
-                    prompts.append("How many units do you need?")
+                    questions.append({"field": field, "question": "How many units do you need?"})
             elif field == "budget_amount":
                 attempted_value = item.get("attempted_value")
-                prompts.append(
+                questions.append({"field": field, "question":
                     f"I could not use the budget value {attempted_value}." if item.get("reason") == "invalid" and attempted_value
                     else "What is your total budget?"
-                )
+                })
             elif field == "currency":
                 attempted_value = item.get("attempted_value")
-                prompts.append(
+                questions.append({"field": field, "question":
                     f"I interpreted the currency as {attempted_value}, but we can only place orders in EUR, CHF, or USD"
                     if item.get("reason") == "invalid" and attempted_value
                     else "Which currency should I use?"
-                )
-        if not prompts:
+                })
+        if not questions:
             field_names = ", ".join(item["field"] for item in missing_fields)
-            return f"I still need critical request details before I can run supplier matching: please provide valid values for {field_names}."
-        return "\n\n".join(prompts)
+            questions.append({"field": "unknown", "question": f"I still need critical request details before I can run supplier matching: please provide valid values for {field_names}."})
+        return questions
 
     def _coerce_category(self, category_l1: str | None, category_l2: str | None) -> dict[str, str] | None:
         if category_l1 and category_l2:
