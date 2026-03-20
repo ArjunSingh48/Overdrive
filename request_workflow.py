@@ -155,12 +155,45 @@ class RequestWorkflowService:
         self._supplier_by_id = {row["supplier_id"]: row for row in self.supplier_rows}
         self._category_names = ", ".join(row["category_l2"] for row in self.categories)
 
-    def run(self, message: str, session_id: str | None = None) -> dict[str, Any]:
+    _NUMERIC_FIELDS = {"quantity", "budget_amount"}
+
+    def run(self, message: str, session_id: str | None = None, answering_field: str | None = None) -> dict[str, Any]:
         run_started = perf_counter()
         session_id = session_id or f"session-{uuid.uuid4().hex[:12]}"
         session_state = self.pending_sessions.get(session_id)
+
+        # Disambiguation: bare number with multiple numeric fields missing and no field clicked
+        if session_state and not answering_field:
+            missing = session_state.get("missing_fields", [])
+            missing_names = {item["field"] for item in missing}
+            ambiguous_numeric = missing_names & self._NUMERIC_FIELDS
+            text = message.strip()
+            is_bare_number = bool(re.match(r"^[\d,]+(?:\.\d+)?\s*[kKmM]?$", text))
+            if is_bare_number and len(ambiguous_numeric) > 1:
+                questions = self._build_follow_up_questions(missing, session_state["request_json"])
+                numeric_questions = [q for q in questions if q["field"] in ambiguous_numeric]
+                labels = " or ".join(f'"{q["question"]}"' for q in numeric_questions)
+                disambiguation_msg = f"I wasn't sure which question \"{text}\" answers. Please click the question you'd like to answer."
+                return {
+                    "status": "needs_clarification",
+                    "session_id": session_id,
+                    "request_json_path": str(REQUEST_JSON_PATH),
+                    "request": session_state["request_json"],
+                    "parser_source": "disambiguation",
+                    "missing_critical_fields": missing,
+                    "follow_up_question": "\n\n".join(q["question"] for q in questions),
+                    "follow_up_questions": questions,
+                    "disambiguation_message": disambiguation_msg,
+                    "engine_output": None,
+                    "ui": {
+                        "summary": disambiguation_msg,
+                        "suppliers": [],
+                        "notifications": [],
+                    },
+                }
+
         parse_started = perf_counter()
-        parse_result = self._parse_request(message, session_state)
+        parse_result = self._parse_request(message, session_state, answering_field)
         parse_ms = (perf_counter() - parse_started) * 1000
         missing_fields = self._find_missing_critical_fields(parse_result.request_json)
 
@@ -171,7 +204,8 @@ class RequestWorkflowService:
 
         if missing_fields:
             total_ms = (perf_counter() - run_started) * 1000
-            question = self._build_follow_up_question(missing_fields, parse_result.request_json)
+            questions = self._build_follow_up_questions(missing_fields, parse_result.request_json)
+            question_text = "\n\n".join(q["question"] for q in questions)
             print(
                 f"[workflow.timing] session_id={session_id} stage=clarification "
                 f"parser={parse_result.source} parse_ms={parse_ms:.1f} total_ms={total_ms:.1f}"
@@ -191,10 +225,11 @@ class RequestWorkflowService:
                 "request": parse_result.request_json,
                 "parser_source": parse_result.source,
                 "missing_critical_fields": missing_fields,
-                "follow_up_question": question,
+                "follow_up_question": question_text,
+                "follow_up_questions": questions,
                 "engine_output": None,
                 "ui": {
-                    "summary": question,
+                    "summary": question_text,
                     "suppliers": [],
                     "notifications": [],
                 },
@@ -233,13 +268,68 @@ class RequestWorkflowService:
             },
         }
 
-    def _try_fast_parse(self, message: str, session_state: dict[str, Any]) -> ParseResult | None:
+    def _try_fast_parse(self, message: str, session_state: dict[str, Any], answering_field: str | None = None) -> ParseResult | None:
         missing = session_state.get("missing_fields", [])
         if not missing:
             return None
         missing_names = {item["field"] for item in missing}
         text = message.strip()
         updates: dict[str, Any] = {}
+
+        # When the user clicked a specific question, a bare number can be
+        # unambiguously assigned to that field
+        if answering_field and answering_field in missing_names:
+            bare_number = self._coerce_float(text) if answering_field == "budget_amount" else None
+            bare_int = self._coerce_int(text) if answering_field == "quantity" else None
+            if answering_field == "quantity" and bare_int and bare_int > 0:
+                updates["quantity"] = bare_int
+                merged = self._merge_request_data(session_state["request_json"], updates)
+                return ParseResult(
+                    request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
+                    source="fast-parse",
+                )
+            if answering_field == "budget_amount" and bare_number and bare_number > 0:
+                updates["budget_amount"] = bare_number
+                # Also check for currency in the same message
+                for word in re.split(r"[\s,.\-;]+", text):
+                    cur = self._normalise_currency(word)
+                    if cur:
+                        updates["currency"] = cur
+                        break
+                merged = self._merge_request_data(session_state["request_json"], updates)
+                return ParseResult(
+                    request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
+                    source="fast-parse",
+                )
+            if answering_field == "currency":
+                cur = self._normalise_currency(text)
+                if cur:
+                    updates["currency"] = cur
+                    merged = self._merge_request_data(session_state["request_json"], updates)
+                    return ParseResult(
+                        request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
+                        source="fast-parse",
+                    )
+            if answering_field == "country":
+                resolved = self._resolve_country_code(text)
+                if resolved:
+                    updates["country"] = self._request_country_code(resolved)
+                    merged = self._merge_request_data(session_state["request_json"], updates)
+                    return ParseResult(
+                        request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
+                        source="fast-parse",
+                    )
+            if answering_field == "category_l2":
+                coerced = self._coerce_category(None, text)
+                if coerced:
+                    updates["category_l1"] = coerced["category_l1"]
+                    updates["category_l2"] = coerced["category_l2"]
+                    merged = self._merge_request_data(session_state["request_json"], updates)
+                    return ParseResult(
+                        request_json=self._normalise_request(merged, session_state["request_json"].get("request_text", ""), message),
+                        source="fast-parse",
+                    )
+            # answering_field was set but we couldn't parse it — fall through to general parsing
 
         # --- quantity (must match before budget so we can exclude quantity numbers from budget matching) ---
         qty_span: tuple[int, int] | None = None
@@ -359,9 +449,9 @@ class RequestWorkflowService:
             source="fast-parse",
         )
 
-    def _parse_request(self, message: str, session_state: dict[str, Any] | None) -> ParseResult:
+    def _parse_request(self, message: str, session_state: dict[str, Any] | None, answering_field: str | None = None) -> ParseResult:
         if session_state:
-            fast = self._try_fast_parse(message, session_state)
+            fast = self._try_fast_parse(message, session_state, answering_field)
             if fast is not None:
                 return fast
             updated = self._update_with_moonshot(session_state["request_json"], message)

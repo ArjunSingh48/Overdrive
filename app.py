@@ -48,6 +48,7 @@ class MatchRequest(BaseModel):
 class ChatWorkflowRequest(BaseModel):
     message: str = Field(..., min_length=1)
     session_id: str | None = None
+    answering_field: str | None = None
 
 
 @app.post("/api/match")
@@ -65,7 +66,7 @@ def match(payload: MatchRequest) -> dict[str, Any]:
 @app.post("/api/workflow")
 def workflow(payload: ChatWorkflowRequest) -> dict[str, Any]:
     try:
-        result = workflow_service.run(payload.message.strip(), payload.session_id)
+        result = workflow_service.run(payload.message.strip(), payload.session_id, payload.answering_field)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     request_id = result["request"]["request_id"]
