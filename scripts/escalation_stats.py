@@ -16,10 +16,12 @@ Breakdowns: FPs by rule fired, FNs by historical escalation target.
 from __future__ import annotations
 
 import json
+import sys
 from collections import Counter, defaultdict
 from csv import DictReader
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from supplier_engine import SupplierEngine, _load_json, DATA_DIR
 
 
@@ -219,7 +221,7 @@ def run(data_dir: Path = DATA_DIR) -> None:
         "tp_cases": tp_rows,
         "tn_cases": tn_rows,
     }
-    out = Path(__file__).parent / "escalation_report.json"
+    out = Path(__file__).resolve().parent.parent / "escalation_report.json"
     with open(out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"\nFull report → {out}")

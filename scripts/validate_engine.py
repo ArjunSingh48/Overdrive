@@ -17,10 +17,12 @@ Outputs
 from __future__ import annotations
 
 import json
+import sys
 from collections import defaultdict
 from csv import DictReader
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from supplier_engine import SupplierEngine, _load_json, DATA_DIR
 
 
@@ -260,7 +262,7 @@ def run_validation(data_dir: Path = DATA_DIR) -> None:
         "disagreements": [c for c in comparisons if not c["all_pass"]],
         "all_comparisons": comparisons,
     }
-    out = Path(__file__).parent / "validate_report.json"
+    out = Path(__file__).resolve().parent.parent / "validate_report.json"
     with open(out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"\nFull report → {out}")

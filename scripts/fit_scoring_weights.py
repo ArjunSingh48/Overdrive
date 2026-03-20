@@ -34,6 +34,7 @@ Outputs:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,6 +42,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from supplier_engine import SupplierEngine, _load_json, DATA_DIR
 from escalation_stats import load_awards, awarded_row
 
@@ -346,7 +349,7 @@ def run(data_dir: Path = DATA_DIR) -> None:
         },
     }
 
-    out_path = Path(__file__).parent / "scoring_weights.json"
+    out_path = Path(__file__).resolve().parent.parent / "scoring_weights.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
     print(f"\nResults saved → {out_path}")

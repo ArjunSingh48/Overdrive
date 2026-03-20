@@ -29,9 +29,10 @@ Overdrive/
 │
 ├── 🐍 CORE PYTHON MODULES
 │   ├── supplier_engine.py             # Main engine (987 lines) - processes requests & ranks suppliers
-│   ├── validate_engine.py             # Validation module (271 lines) - compares against historical awards
-│   ├── escalation_stats.py            # Escalation analysis (230 lines) - confusion matrix & metrics
-│   └── fit_scoring_weights.py         # Weight fitting module (357 lines) - ML model for scoring
+│   └── scripts/
+│       ├── validate_engine.py         # Validation module (271 lines) - compares against historical awards
+│       ├── escalation_stats.py        # Escalation analysis (230 lines) - confusion matrix & metrics
+│       └── fit_scoring_weights.py     # Weight fitting module (357 lines) - ML model for scoring
 │
 ├── 📦 OUTPUT & CONFIGURATION FILES
 │   ├── outputs.json                   # Engine output: ranked suppliers per request (~56K lines)
@@ -210,7 +211,7 @@ python supplier_engine.py
 
 ### Fit Scoring Weights (ML Training)
 ```bash
-python fit_scoring_weights.py
+python scripts/fit_scoring_weights.py
 # Reads: data/historical_awards.csv + suppliers data
 # Outputs: scoring_weights.json (optimized weights)
 # Trains pairwise logistic regression on historical procurement decisions
@@ -218,14 +219,14 @@ python fit_scoring_weights.py
 
 ### Validate Against Historical Data
 ```bash
-python validate_engine.py
+python scripts/validate_engine.py
 # Compares engine output against historical_awards.csv on 4 dimensions
 # Outputs: validate_report.json + console summary
 ```
 
 ### Analyse Escalation Decisions
 ```bash
-python escalation_stats.py
+python scripts/escalation_stats.py
 # Confusion matrix: our escalations vs. history
 # Outputs: escalation_report.json + console confusion matrix + metrics
 ```
@@ -266,7 +267,7 @@ requests.json
     ↓
 outputs.json (with rankings & escalations)
     ↓
-[validate_engine.py / escalation_stats.py]
+[scripts/validate_engine.py / scripts/escalation_stats.py]
     ├─ Compare vs. historical_awards.csv
     ├─ Measure accuracy (winner match, shortlist, escalations)
     └─ Generate validate_report.json & escalation_report.json
